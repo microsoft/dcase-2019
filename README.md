@@ -1,4 +1,7 @@
 
+# DCASE 2019 -- Microsoft Dynamics 365 AI
+Submission for DCASE 2019, Task 5
+
 # Contributing
 
 This project welcomes contributions and suggestions.  Most contributions require you to agree to a
