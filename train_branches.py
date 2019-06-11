@@ -1,4 +1,9 @@
+import argparse
+
 from datetime import datetime
+import gc
+
+import joblib
 
 from poutyne.framework import Model
 from poutyne.framework.callbacks import *
@@ -11,41 +16,52 @@ from torch.utils.data import DataLoader
 
 from load_dataset import AudioDatasetFine, label_hierarchy
 
-DATE = datetime.now().strftime('%Y%m%d_%H%M%S')
-
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-train_dir = r"D:\DCASE_2019\audio\augmented\spec_vgg\train"
-test_dir = r"D:\DCASE_2019\audio\augmented\spec_vgg\validate"
+#train_dir = r"D:\datasets\dcase5_processed\spec_vgg\train"
+#test_dir = r"D:\datasets\dcase5_processed\spec_vgg\validate"
+train_dir = r"/dcase/spec_vgg/train"
+test_dir = r"/dcase/spec_vgg/validate"
 
-coarse_index = 0
+MODEL_BASE = r'/dcase/output/models'
+TENSORBOARD_BASE = r'/dcase/output/tensorboard'
 
-BATCH_SIZE = 32
-label_start, label_end = label_hierarchy[coarse_index + 1]
-NUM_CLASSES = len(range(label_start, label_end))
-print('number of classes:', NUM_CLASSES)
+os.makedirs(MODEL_BASE, exist_ok=True)
+os.makedirs(TENSORBOARD_BASE, exist_ok=True)
 
-TRAIN = AudioDatasetFine(train_dir, coarse_index)
-TEST = AudioDatasetFine(test_dir, coarse_index)
+index_to_files_dict_train = joblib.load('/dcase/spec_vgg/label_to_files_train.zip')
+index_to_files_dict_test = joblib.load('/dcase/spec_vgg/label_to_files_test.zip')
 
-TRAIN_LOADER = DataLoader(dataset=TRAIN, batch_size=BATCH_SIZE, shuffle=True)
-TEST_LOADER = DataLoader(dataset=TEST, batch_size=BATCH_SIZE, shuffle=True)
+NUM_COARSE_LABELS = 8
+BATCH_SIZE = 64
+MAX_EPOCHS = 100
 
+USE_EXAMPLE_WEIGHTS = True
 
-# train_sampler = torch.utils.data.sampler.WeightedRandomSampler(TRAIN_WEIGHTS, 2351)
-# test_sampler = torch.utils.data.sampler.WeightedRandomSampler(TEST_WEIGHTS, 443)
+if USE_EXAMPLE_WEIGHTS:
+    weights_fine = joblib.load('weights_fine_train.pkl')
 
 
 class ConvBlock(nn.Module):
     """This creates a convolutional layer with optional maxpool, batchnorm, and dropout"""
-    def __init__(self, in_channels, out_channels, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1),
-                 batchnorm=True, maxpool=True, maxpool_size=(2, 2), dropout=None):
+
+    def __init__(self,
+                 in_channels,
+                 out_channels,
+                 kernel_size=(3, 3),
+                 stride=(1, 1),
+                 padding=(1, 1),
+                 batchnorm=True,
+                 maxpool=True,
+                 maxpool_size=(2, 2),
+                 dropout=None):
         super(ConvBlock, self).__init__()
 
         self.conv = nn.Conv2d(in_channels=in_channels,
                               out_channels=out_channels,
-                              kernel_size=kernel_size, stride=stride,
-                              padding=padding) # , bias=False ?
+                              kernel_size=kernel_size,
+                              stride=stride,
+                              padding=padding)  # , bias=False ?
         # print('kernel', kernel_size, stride, padding, maxpool)
         if maxpool:
             self.mp = nn.MaxPool2d(maxpool_size, stride=maxpool_size)
@@ -82,34 +98,78 @@ class ConvBlock(nn.Module):
 
 class VGG_alt(nn.Module):
     """Based on AudioSet paper, with some maxpool size modifications"""
-    def __init__(self):
+
+    def __init__(self, num_classes):
         super(VGG_alt, self).__init__()
+
+        self.NUM_CLASSES = num_classes
 
         DROPOUT = .5
         self.emb_size = 49152
 
         # spectrogram convolutions
-        self.conv_block_1 = ConvBlock(in_channels=1, out_channels=8, kernel_size=(1, 1), stride=(1, 1),
-                                       padding=(0, 0), batchnorm=True, maxpool=False, maxpool_size=(2, 16), dropout=DROPOUT)
+        self.conv_block_1 = ConvBlock(in_channels=1,
+                                      out_channels=8,
+                                      kernel_size=(1, 1),
+                                      stride=(1, 1),
+                                      padding=(0, 0),
+                                      batchnorm=True,
+                                      maxpool=False,
+                                      maxpool_size=(2, 16),
+                                      dropout=DROPOUT)
 
-        self.conv_block_2 = ConvBlock(in_channels=8, out_channels=16, kernel_size=(3, 3), stride=(1, 1),
-                                       padding=(1, 1), batchnorm=True, maxpool=False, maxpool_size=(2, 2), dropout=DROPOUT)
+        self.conv_block_2 = ConvBlock(in_channels=8,
+                                      out_channels=16,
+                                      kernel_size=(3, 3),
+                                      stride=(1, 1),
+                                      padding=(1, 1),
+                                      batchnorm=True,
+                                      maxpool=False,
+                                      maxpool_size=(2, 2),
+                                      dropout=DROPOUT)
 
-        self.conv_block_3 = ConvBlock(in_channels=16, out_channels=32, kernel_size=(16, 128), stride=(4, 16),
-                                       padding=(8, 16), batchnorm=True, maxpool=True, maxpool_size=(4, 4), dropout=DROPOUT)
+        self.conv_block_3 = ConvBlock(in_channels=16,
+                                      out_channels=32,
+                                      kernel_size=(16, 128),
+                                      stride=(4, 16),
+                                      padding=(8, 16),
+                                      batchnorm=True,
+                                      maxpool=True,
+                                      maxpool_size=(4, 4),
+                                      dropout=DROPOUT)
 
-        self.conv_block_4 = ConvBlock(in_channels=32, out_channels=64, kernel_size=(5, 5), stride=(2, 2),
-                                       padding=(1, 1), batchnorm=True, maxpool=False, maxpool_size=(2, 2), dropout=DROPOUT)
+        self.conv_block_4 = ConvBlock(in_channels=32,
+                                      out_channels=64,
+                                      kernel_size=(5, 5),
+                                      stride=(2, 2),
+                                      padding=(1, 1),
+                                      batchnorm=True,
+                                      maxpool=False,
+                                      maxpool_size=(2, 2),
+                                      dropout=DROPOUT)
 
-        self.conv_block_5 = ConvBlock(in_channels=64, out_channels=128, kernel_size=(5, 5), stride=(2, 2),
-                                       padding=(1, 1), batchnorm=True, maxpool=False, maxpool_size=None, dropout=DROPOUT)
+        self.conv_block_5 = ConvBlock(in_channels=64,
+                                      out_channels=128,
+                                      kernel_size=(5, 5),
+                                      stride=(2, 2),
+                                      padding=(1, 1),
+                                      batchnorm=True,
+                                      maxpool=False,
+                                      maxpool_size=None,
+                                      dropout=DROPOUT)
 
-        self.conv_block_6 = ConvBlock(in_channels=128, out_channels=256, kernel_size=(3, 3), stride=(2, 2),
-                                       padding=(1, 1), batchnorm=True, maxpool=False, maxpool_size=(2, 4), dropout=DROPOUT)
+        self.conv_block_6 = ConvBlock(in_channels=128,
+                                      out_channels=256,
+                                      kernel_size=(3, 3),
+                                      stride=(2, 2),
+                                      padding=(1, 1),
+                                      batchnorm=True,
+                                      maxpool=False,
+                                      maxpool_size=(2, 4),
+                                      dropout=DROPOUT)
 
         # self.conv_block_7 = ConvBlock(in_channels=128, out_channels=256, kernel_size=(3, 3), stride=(1, 1),
         #                               padding=(1, 1), batchnorm=True, maxpool=False, maxpool_size=(2, 4), dropout=DROPOUT)
-
 
         # openl3 embedding convolutions
         # self.emb_conv_1 = ConvBlock(in_channels=1, out_channels=4, kernel_size=(5, 5), stride=(2, 2),
@@ -133,7 +193,7 @@ class VGG_alt(nn.Module):
         self.fc2_bn = nn.BatchNorm1d(256)
         # self.fc3 = nn.Linear(2**7, 2**6, bias=True)
         # self.fc4 = nn.Linear(2**8, 2**6, bias=True)
-        self.fc_final = nn.Linear(256, NUM_CLASSES, bias=True)
+        self.fc_final = nn.Linear(256, self.NUM_CLASSES, bias=True)
 
         self.dropout = nn.Dropout(.2)
 
@@ -199,11 +259,36 @@ class VGG_alt(nn.Module):
         return output
 
 
-if __name__ == '__main__':
+def get_label_range(coarse_index):
+    label_start, label_end = label_hierarchy[coarse_index + 1]
+    NUM_CLASSES = len(range(label_start, label_end))
+    return label_start, label_end, NUM_CLASSES
+
+  
+
+def train_model(coarse_index, DATE):
+    label_start, label_end, NUM_CLASSES = get_label_range(coarse_index)
+    print('number of classes:', NUM_CLASSES)
+
+    if NUM_CLASSES < 2:
+        print('Skipping this coarse category.')
+        return
+
+    TRAIN = AudioDatasetFine(train_dir, coarse_index,
+                             index_to_files_dict_train)
+    TEST = AudioDatasetFine(test_dir, coarse_index, index_to_files_dict_test)
+
+    TRAIN_LOADER = DataLoader(dataset=TRAIN,
+                              batch_size=BATCH_SIZE,
+                              shuffle=True)
+    TEST_LOADER = DataLoader(dataset=TEST, batch_size=BATCH_SIZE, shuffle=True)
+
+    # train_sampler = torch.utils.data.sampler.WeightedRandomSampler(TRAIN_WEIGHTS, 2351)
+    # test_sampler = torch.utils.data.sampler.WeightedRandomSampler(TEST_WEIGHTS, 443)
 
     # model = NeuralNetwork().to(device)
     # model = VGG_11().to(device)
-    model = VGG_alt().to(device)
+    model_tmp = VGG_alt(NUM_CLASSES).to(device)
     # model = OpenL3().to(device)
 
     ## if training from checkpoint; ensure checkpoint matches model class architecture
@@ -213,36 +298,120 @@ if __name__ == '__main__':
     # Loss and optimizer
     # criterion = nn.BCELoss()  # must be this for multi-label predictions
     # criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(np.array(TRAIN_WEIGHTS).astype(np.float32)**.2).to(device))
+
+    if USE_EXAMPLE_WEIGHTS:
+        weights = weights_fine[coarse_index]
+        print(f'Using sample weights: {weights}')
+        criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(np.array(weights).astype(np.float32)).to(device))
+        #criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(np.array(weights_fine[coarse_index]).astype(np.float32)**.2).to(device))
+    else:
+        print('Not using sample weights.')
+
     criterion = nn.BCEWithLogitsLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=.001)
+
+    optimizer = torch.optim.Adam(model_tmp.parameters(), lr=.001)
 
     # to Poutyne
-    model = Model(model, optimizer, criterion, metrics=['bin_acc'])
+    model = Model(model_tmp, optimizer, criterion, metrics=['bin_acc'])
 
     # Callbacks
-    tb_writer = SummaryWriter('./tensorboard/{}'.format(DATE))
+    tb_writer = SummaryWriter(os.path.join(TENSORBOARD_BASE, f'{DATE}_coarse={coarse_index}'))
 
     callbacks = [
         # Save the latest weights to be able to continue the optimization at the end for more epochs.
-        ModelCheckpoint('./models/%s_last_epoch.ckpt' % DATE, temporary_filename='last_epoch.ckpt.tmp'),
+        ModelCheckpoint(
+            os.path.join(MODEL_BASE, f'{DATE}_coarse={coarse_index}_last_epoch.ckpt'),
+            temporary_filename=os.path.join(MODEL_BASE, 'last_epoch.ckpt.tmp')),
 
         # Save the weights in a new file when the current model is better than all previous models.
-        ModelCheckpoint('./models/%s_best_epoch_{epoch}_val_loss={val_loss:.4f}.ckpt' % DATE, monitor='val_loss', mode='min',
-                        save_best_only=True, restore_best=True,
-                        verbose=True, temporary_filename='best_epoch.ckpt.tmp'),
+        ModelCheckpoint(
+            os.path.join(MODEL_BASE, '%s_coarse=%d_best_epoch_{epoch}_val_loss={val_loss:.4f}.ckpt'
+                % (DATE, coarse_index)),
+            monitor='val_loss',
+            mode='min',
+            save_best_only=True,
+            restore_best=False,  #True
+            verbose=True,
+            temporary_filename=os.path.join(MODEL_BASE, 'best_epoch.ckpt.tmp')),
 
         # Save the losses and accuracies for each epoch in a TSV.
-        CSVLogger('./models/log.tsv', separator='\t'),
-
+        CSVLogger(os.path.join(MODEL_BASE, f'{DATE}_coarse={coarse_index}_log.tsv'),
+                  separator='\t'),
         ReduceLROnPlateau(patience=5, verbose=True, factor=0.1),
         EarlyStopping(patience=10, verbose=True),
         TerminateOnNaN(),
         # policies.sgdr_phases(6, 6, lr=(1.0, 0.1), cycle_mult = 2) # doesn't work as callback
     ]
 
-    save_file_path = './models/weights.{epoch:02d}-{val_loss:.4f}.txt'
-    save_best_model = PeriodicSaveCallback(save_file_path, temporary_filename='./tmp/file.txt', atomic_write=False,
-                                           save_best_only=True, verbose=True)
+    save_file_path = os.path.join(MODEL_BASE, '%s_coarse=%d_weights.{epoch:02d}-{val_loss:.4f}.txt' % (
+        DATE, coarse_index))
+    save_best_model = PeriodicSaveCallback(save_file_path,
+                                           temporary_filename=os.path.join(MODEL_BASE, 'tmp_file.txt'),
+                                           atomic_write=False,
+                                           save_best_only=True,
+                                           verbose=True)
 
     # Train the model
-    model.fit_generator(TRAIN_LOADER, TEST_LOADER, epochs=10000, callbacks=callbacks)
+    model.fit_generator(TRAIN_LOADER,
+                        TEST_LOADER,
+                        epochs=MAX_EPOCHS,
+                        callbacks=callbacks)
+
+    del optimizer
+    del model
+    del model_tmp
+
+    del TEST_LOADER
+    del TRAIN_LOADER
+    del TEST
+    del TRAIN
+
+
+def print_gpu_ram():
+    print(f'GPU memory allocated: {torch.cuda.memory_allocated()}')
+    print(f'GPU memory cached: {torch.cuda.memory_cached()}')
+
+    # for obj in gc.get_objects():
+    #     try:
+    #         if torch.is_tensor(obj) or (hasattr(obj, 'data')
+    #                                     and torch.is_tensor(obj.data)):
+    #             print(type(obj), obj.size())
+    #             del obj
+    #     except:
+    #         pass
+
+
+def main(coarse_category_idx, DATE):
+    global BATCH_SIZE
+
+    print(
+        f'\n*****************\nTraining model for coarse category {coarse_category_idx}\n*******\n'
+    )
+    print_gpu_ram()
+
+    # Hack to avoid batch-size 1 in final batch, which causes crash in batch-norm.
+    # TODO: Should fix in Poutyne training loop to skip final batch when this happens.
+    if coarse_category_idx == 3:
+        BATCH_SIZE = 63
+
+    print('Training')
+    train_model(coarse_category_idx, DATE)
+
+    print('Done training.')
+    print_gpu_ram()
+
+    print('Clearing GPU ram')
+    torch.cuda.empty_cache()
+
+
+if __name__ == '__main__':
+
+    parser = argparse.ArgumentParser(
+        description='Train model for a single coarse category.')
+
+    parser.add_argument('index', type=int, help='coarse category index')
+    parser.add_argument('date', type=str, help='date string')
+
+    args = parser.parse_args()
+
+    main(args.index, args.date)
